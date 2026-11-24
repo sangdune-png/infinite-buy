@@ -1,5 +1,7 @@
 import math
-from datetime import datetime
+import re
+import time
+from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -17,7 +19,7 @@ st.set_page_config(
 )
 
 # ==========================================
-# 1. 자연어 파싱용 데이터 스키마 (Pydantic)
+# 1. 파라미터 스키마 및 이중 자연어 파서 (Gemini + 내장 고속 파서)
 # ==========================================
 class BacktestParams(BaseModel):
     ticker: str = Field(default="TQQQ", description="미국 주식/ETF 티커 (예: TQQQ, SOXL, UPRO)")
@@ -28,10 +30,126 @@ class BacktestParams(BaseModel):
     use_quarter_cut: bool = Field(default=True, description="원금 소진 시 쿼터 손절 모드 적용 여부")
     apply_tax: bool = Field(default=True, description="연말 양도소득세 22% 정산 반영 여부")
     fee_rate_pct: float = Field(default=0.07, description="편도 수수료+슬리피지(%)")
-    parsed_note: str = Field(default="", description="해석한 조건을 한국어 한 줄로 요약")
+    parsed_note: str = Field(default="", description="해석 엔진 정보")
+
+
+def fallback_regex_parse(user_text: str) -> BacktestParams:
+    """구글 AI 서버 혼잡(503) 또는 할당량 초과(429) 시 즉시 작동하는 내장 파서"""
+    text = user_text.strip()
+    upper_text = text.upper()
+    today = datetime.now()
+    today_str = today.strftime("%Y-%m-%d")
+
+    # 1) 티커 추출
+    known_tickers = [
+        "TQQQ", "SOXL", "UPRO", "TECL", "FNGU", "BULZ", "QLD", "SSO",
+        "QQQ", "SPY", "VOO", "SCHD", "TSLL", "NVDL", "TNA", "TMF", "LABU", "YINN"
+    ]
+    ticker = "TQQQ"
+    found_known = False
+    for tk in known_tickers:
+        if re.search(rf"\b{tk}\b", upper_text):
+            ticker = tk
+            found_known = True
+            break
+    if not found_known:
+        m_tk = re.search(r"\b([A-Z]{2,5})\b", upper_text)
+        if m_tk and m_tk.group(1) not in {"USD", "KRW", "OFF", "ON", "ETF"}:
+            ticker = m_tk.group(1)
+
+    # 2) 기간 추출
+    start_date = (today - timedelta(days=365)).strftime("%Y-%m-%d")
+    end_date = today_str
+
+    full_dates = re.findall(r"(20\d{2}[-./]\d{1,2}[-./]\d{1,2})", text)
+    if len(full_dates) >= 2:
+        start_date = pd.to_datetime(full_dates[0]).strftime("%Y-%m-%d")
+        end_date = pd.to_datetime(full_dates[1]).strftime("%Y-%m-%d")
+    elif len(full_dates) == 1:
+        start_date = pd.to_datetime(full_dates[0]).strftime("%Y-%m-%d")
+        end_date = today_str
+    else:
+        m_recent_y = re.search(r"최근\s*(\d+)\s*년", text)
+        m_recent_m = re.search(r"최근\s*(\d+)\s*개월", text)
+        years_found = re.findall(r"(20\d{2}|19\d{2})\s*년?", text)
+
+        if m_recent_y:
+            n_y = int(m_recent_y.group(1))
+            start_date = (today - timedelta(days=365 * n_y)).strftime("%Y-%m-%d")
+            end_date = today_str
+        elif m_recent_m:
+            n_m = int(m_recent_m.group(1))
+            start_date = (today - timedelta(days=30 * n_m)).strftime("%Y-%m-%d")
+            end_date = today_str
+        elif "작년" in text:
+            ly = today.year - 1
+            start_date, end_date = f"{ly}-01-01", f"{ly}-12-31"
+        elif "올해" in text:
+            start_date, end_date = f"{today.year}-01-01", today_str
+        elif "코로나" in text:
+            start_date, end_date = "2020-01-01", "2020-12-31"
+        elif len(years_found) >= 2:
+            y1, y2 = sorted([int(years_found[0]), int(years_found[1])])
+            start_date, end_date = f"{y1}-01-01", f"{y2}-12-31"
+        elif len(years_found) == 1:
+            y1 = int(years_found[0])
+            if "부터" in text or "이후" in text:
+                start_date, end_date = f"{y1}-01-01", today_str
+            else:
+                start_date, end_date = f"{y1}-01-01", f"{y1}-12-31"
+
+    # 3) 원금 추출 (달러 / 원화 자동 환산)
+    initial_cash = 10000.0
+    clean_num_text = text.replace(",", "")
+
+    if m := re.search(r"(\d+(?:\.\d+)?)\s*만\s*달러", clean_num_text):
+        initial_cash = float(m.group(1)) * 10000.0
+    elif m := re.search(r"(\d+(?:\.\d+)?)\s*천\s*달러", clean_num_text):
+        initial_cash = float(m.group(1)) * 1000.0
+    elif m := re.search(r"\$\s*(\d+(?:\.\d+)?)|(\d+(?:\.\d+)?)\s*(?:달러|불)", clean_num_text):
+        val = m.group(1) or m.group(2)
+        initial_cash = float(val)
+    elif m := re.search(r"(\d+(?:\.\d+)?)\s*억\s*원?", clean_num_text):
+        initial_cash = round(float(m.group(1)) * 100000000.0 / 1350.0, 2)
+    elif m := re.search(r"(\d+(?:\.\d+)?)\s*천\s*만\s*원?", clean_num_text):
+        initial_cash = round(float(m.group(1)) * 10000000.0 / 1350.0, 2)
+    elif m := re.search(r"(\d+(?:\.\d+)?)\s*만\s*원", clean_num_text):
+        initial_cash = round(float(m.group(1)) * 10000.0 / 1350.0, 2)
+
+    # 4) 분할 횟수, 쿼터 손절, 양도세, 수수료
+    split_count = 40
+    if m := re.search(r"(\d+)\s*분할", text):
+        split_count = max(1, int(m.group(1)))
+
+    use_quarter_cut = True
+    if re.search(r"쿼터.{0,6}(빼|제외|없|끄|안|미적용|off)|존버", text, re.IGNORECASE):
+        use_quarter_cut = False
+
+    apply_tax = True
+    if re.search(r"세전|(?:양도세|세금).{0,6}(빼|제외|없|끄|안|미적용|off)", text, re.IGNORECASE):
+        apply_tax = False
+
+    fee_rate_pct = 0.07
+    if m := re.search(r"수수료\s*(\d+(?:\.\d+)?)\s*%", text):
+        fee_rate_pct = float(m.group(1))
+
+    return BacktestParams(
+        ticker=ticker,
+        start_date=start_date,
+        end_date=end_date,
+        initial_cash=initial_cash,
+        split_count=split_count,
+        use_quarter_cut=use_quarter_cut,
+        apply_tax=apply_tax,
+        fee_rate_pct=fee_rate_pct,
+        parsed_note="내장 고속 파서(구글 AI 서버 혼잡 자동 우회)"
+    )
 
 
 def parse_user_prompt(api_key: str, user_text: str) -> BacktestParams:
+    if not api_key:
+        return fallback_regex_parse(user_text)
+
     client = genai.Client(api_key=api_key)
     today_str = datetime.now().strftime("%Y-%m-%d")
 
@@ -40,23 +158,34 @@ def parse_user_prompt(api_key: str, user_text: str) -> BacktestParams:
     오늘 날짜는 {today_str}이다.
     사용자의 자연어 요청에서 백테스트 실행에 필요한 파라미터를 정확히 추출해 JSON으로 반환하라.
     - 언급되지 않은 항목은 기본값을 사용하라.
-    - '작년', '최근 3년', '코로나 때' 같은 상대적 기간은 오늘 날짜({today_str}) 기준으로 YYYY-MM-DD로 변환하라.
+    - '작년', '최근 1년', '최근 3년', '코로나 때' 같은 상대적 기간은 오늘 날짜({today_str}) 기준으로 YYYY-MM-DD로 변환하라.
     - 사용자가 원화(예: 1천만원, 5000만원)로 말하면 1달러=1350원 기준으로 initial_cash(달러)로 환산하라.
     - '존버', '쿼터 손절 빼고'라고 하면 use_quarter_cut을 false로 설정하라.
     - '세전', '양도세 제외'라고 하면 apply_tax를 false로 설정하라.
     """
 
-    response = client.models.generate_content(
-        model="gemini-3.8-flash",
-        contents=user_text,
-        config=types.GenerateContentConfig(
-            system_instruction=system_instruction,
-            response_mime_type="application/json",
-            response_schema=BacktestParams,
-            temperature=0.0,
-        ),
-    )
-    return BacktestParams.model_validate_json(response.text)
+    # 1순위: Gemini API 호출 (503/429 일시 혼잡 시 1회 자동 재시도)
+    for attempt in range(2):
+        try:
+            response = client.models.generate_content(
+                model="gemini-3.8-flash",
+                contents=user_text,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    response_mime_type="application/json",
+                    response_schema=BacktestParams,
+                    temperature=0.0,
+                ),
+            )
+            params = BacktestParams.model_validate_json(response.text)
+            params.parsed_note = "Gemini AI 해석"
+            return params
+        except Exception:
+            if attempt == 0:
+                time.sleep(1.2)
+            else:
+                # 2순위: 서버 혼잡/할당량 초과 시 에러 없이 내장 파서로 즉시 전환
+                return fallback_regex_parse(user_text)
 
 
 # ==========================================
@@ -363,38 +492,19 @@ def build_chart(res: pd.DataFrame, ticker: str, summary: dict):
 
 
 # ==========================================
-# 5. Streamlit 채팅 UI
+# 5. 결과 렌더링 및 실행 함수
 # ==========================================
-st.title("📈 무한매수법 v2.2 AI 백테스터")
-st.caption("말로 지시하면 Gemini가 조건을 해석하고 파이썬 엔진이 정확히 계산합니다.")
-
-with st.sidebar:
-    st.subheader("설정")
-    secret_key = st.secrets.get("GEMINI_API_KEY", "") if hasattr(st, "secrets") else ""
-    api_key = secret_key or st.text_input("Gemini API Key", type="password", placeholder="AIza...")
-    if st.button("대화 초기화"):
-        st.session_state.messages = []
-        st.rerun()
-    st.markdown("---")
-    st.markdown(
-        "**입력 예시**\n"
-        "- TQQQ 2011년부터 2024년까지 1만달러 돌려줘\n"
-        "- SOXL 2022년 폭락장 쿼터손절 빼고 세전으로 확인\n"
-        "- TQQQ 최근 5년 30분할 3천만원 결과 보여줘"
-    )
-
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-
 def render_result(msg):
     params = msg["params"]
     s = msg["summary"]
+    note = params.get("parsed_note", "")
+    note_str = f" | {note}" if note else ""
+
     st.info(
         f"**적용 조건:** {params['ticker']} | {s['actual_start']}부터 {s['actual_end']}까지 | "
         f"원금 ${params['initial_cash']:,.0f} ({params['split_count']}분할) | "
         f"쿼터손절 {'ON' if params['use_quarter_cut'] else 'OFF'} | "
-        f"양도세 {'ON' if params['apply_tax'] else 'OFF'}"
+        f"양도세 {'ON' if params['apply_tax'] else 'OFF'}{note_str}"
     )
     c1, c2 = st.columns(2)
     c1.metric("최종 평가액", f"${s['v_final']:,.0f}", f"누적 {s['v_ret']:+.1f}%")
@@ -418,6 +528,61 @@ def render_result(msg):
         )
 
 
+def execute_and_append(params: BacktestParams):
+    df = load_ohlc(params.ticker, params.start_date, params.end_date)
+    if df.empty or len(df) < 2:
+        st.error(f"'{params.ticker}'의 해당 기간({params.start_date}부터 {params.end_date}까지) 데이터를 불러오지 못했습니다.")
+        return
+    res, logs, summary = run_infinite_buy_v22(df, params)
+    payload = {
+        "role": "assistant",
+        "params": params.model_dump(),
+        "summary": summary,
+        "res": res,
+        "logs": logs,
+        "dl_key": f"dl_{len(st.session_state.messages)}_{int(time.time())}"
+    }
+    render_result(payload)
+    st.session_state.messages.append(payload)
+
+
+# ==========================================
+# 6. Streamlit UI
+# ==========================================
+st.title("📈 무한매수법 v2.2 AI 백테스터")
+st.caption("말로 지시하면 조건을 해석해 파이썬 엔진이 정확히 계산합니다. (구글 서버 혼잡 시 자동 우회)")
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+with st.sidebar:
+    st.subheader("설정")
+    secret_key = st.secrets.get("GEMINI_API_KEY", "") if hasattr(st, "secrets") else ""
+    api_key = secret_key or st.text_input("Gemini API Key (선택)", type="password")
+    if st.button("대화 초기화", use_container_width=True):
+        st.session_state.messages = []
+        st.rerun()
+
+    st.markdown("---")
+    st.subheader("직접 선택 실행")
+    with st.form("manual_form"):
+        m_ticker = st.text_input("종목 티커", value="TQQQ")
+        m_start = st.date_input("시작일", value=datetime(2020, 1, 1))
+        m_end = st.date_input("종료일", value=datetime.now())
+        m_cash = st.number_input("초기 원금($)", min_value=100.0, value=10000.0, step=1000.0)
+        m_split = st.number_input("분할 횟수", min_value=10, max_value=100, value=40, step=5)
+        m_qcut = st.checkbox("쿼터 손절 적용", value=True)
+        m_tax = st.checkbox("연말 양도세(22%) 반영", value=True)
+        manual_submit = st.form_submit_button("백테스트 실행", use_container_width=True)
+
+    st.markdown("---")
+    st.markdown(
+        "**채팅 입력 예시**\n"
+        "- TQQQ 최근 1년 1만달러 돌려줘\n"
+        "- SOXL 2022년 폭락장 쿼터손절 빼고 세전으로\n"
+        "- TQQQ 2011년부터 2024년까지 3천만원 결과"
+    )
+
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         if msg["role"] == "user":
@@ -425,11 +590,26 @@ for msg in st.session_state.messages:
         else:
             render_result(msg)
 
-if prompt := st.chat_input("예: TQQQ 2022년부터 2024년까지 쿼터손절 켜고 돌려줘"):
-    if not api_key:
-        st.error("사이드바 또는 Streamlit Secrets에 GEMINI_API_KEY를 먼저 등록해 주세요.")
-        st.stop()
+if manual_submit:
+    user_label = f"[직접 실행] {m_ticker.upper()} | {m_start}부터 {m_end}까지 | ${m_cash:,.0f} ({m_split}분할)"
+    st.session_state.messages.append({"role": "user", "content": user_label})
+    with st.chat_message("user"):
+        st.markdown(user_label)
+    with st.chat_message("assistant"):
+        with st.spinner("백테스트 계산 중..."):
+            manual_params = BacktestParams(
+                ticker=m_ticker.upper().strip(),
+                start_date=m_start.strftime("%Y-%m-%d"),
+                end_date=m_end.strftime("%Y-%m-%d"),
+                initial_cash=float(m_cash),
+                split_count=int(m_split),
+                use_quarter_cut=m_qcut,
+                apply_tax=m_tax,
+                parsed_note="직접 선택 실행"
+            )
+            execute_and_append(manual_params)
 
+if prompt := st.chat_input("예: TQQQ 최근 1년 1만달러 돌려줘"):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
@@ -438,20 +618,6 @@ if prompt := st.chat_input("예: TQQQ 2022년부터 2024년까지 쿼터손절 �
         with st.spinner("조건 해석 및 백테스트 계산 중..."):
             try:
                 params = parse_user_prompt(api_key, prompt)
-                df = load_ohlc(params.ticker, params.start_date, params.end_date)
-                if df.empty or len(df) < 2:
-                    st.error(f"'{params.ticker}'의 해당 기간 데이터를 불러오지 못했습니다. 티커나 날짜를 확인해 주세요.")
-                else:
-                    res, logs, summary = run_infinite_buy_v22(df, params)
-                    result_payload = {
-                        "role": "assistant",
-                        "params": params.model_dump(),
-                        "summary": summary,
-                        "res": res,
-                        "logs": logs,
-                        "dl_key": f"dl_{len(st.session_state.messages)}"
-                    }
-                    render_result(result_payload)
-                    st.session_state.messages.append(result_payload)
+                execute_and_append(params)
             except Exception as e:
                 st.error(f"실행 중 오류가 발생했습니다: {e}")
